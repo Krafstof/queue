@@ -1,0 +1,22 @@
+# Binaries
+benchmarks/bin/
+router
+queue_benchmark
+memory_allocation_benchmark
+routing_latency_benchmark
+scaling_benchmark
+
+# Docker build cache / temp
+[internal]/
+[router-benchmark]/
+[router-test]/
+=CACHED
+
+# Results and logs
+results/
+
+# OS / editor files
+*.swp
+*.DS_Store
+*.vscode/
+.idea/

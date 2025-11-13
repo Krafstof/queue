@@ -1,0 +1,25 @@
+services:
+  router-test:
+    build:
+      context: .
+      target: runtime
+    container_name: router_test
+    volumes:
+      - ./results:/app/results
+      - ./configs:/app/configs
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+    # 👇 default command to run all tests when no arguments are passed
+    command: ["bash", "scripts/run_all_tests.sh"]
+
+  router-benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+    working_dir: /app
+    entrypoint: ["bash", "scripts/run_benchmarks.sh"]
