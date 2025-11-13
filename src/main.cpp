@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <cstdint>
 #include <array>
+#include <mutex>
 #include "../include/json.hpp"
 
 using json = nlohmann::json;
@@ -115,6 +116,32 @@ static inline uint64_t now_ns() {
 
 constexpr size_t QUEUE_SIZE = 1 << 14;
 
+// ==========================================================
+// Latency Statistics
+// ==========================================================
+struct LatencyStats {
+    std::mutex mtx;
+    std::vector<double> stage1_us;
+    std::vector<double> processing_us;
+    std::vector<double> stage2_us;
+    std::vector<double> total_us;
+
+    void add(double s1, double proc, double s2, double total) {
+        std::lock_guard<std::mutex> lock(mtx);
+        stage1_us.push_back(s1);
+        processing_us.push_back(proc);
+        stage2_us.push_back(s2);
+        total_us.push_back(total);
+    }
+
+    static double percentile(std::vector<double>& v, double p) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        size_t idx = std::min((size_t)(p * v.size()), v.size() - 1);
+        return v[idx];
+    }
+};
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <config.json> <results_dir>\n";
@@ -126,14 +153,12 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(results_dir);
 
     std::string scenario = std::filesystem::path(config_path).stem().string();
-
     std::string log_path = results_dir + "/" + scenario + "_log.txt";
     std::string summary_path = results_dir + "/" + scenario + "_summary.txt";
     std::ofstream log_file(log_path);
     std::ofstream summary_file(summary_path);
 
     Config cfg = load_config(config_path);
-
     std::cout << "Running scenario: " << scenario << std::endl;
 
     std::vector<std::unique_ptr<SPSCQueue<Message, QUEUE_SIZE>>> stage1_queues;
@@ -145,8 +170,11 @@ int main(int argc, char** argv) {
 
     std::atomic<bool> stop_flag = false;
     std::atomic<uint64_t> produced = 0, processed = 0, delivered = 0;
+    LatencyStats latencies;
 
+    // ==========================================================
     // Producers
+    // ==========================================================
     std::vector<std::thread> producers;
     for (int pid = 0; pid < cfg.producer_count; ++pid) {
         producers.emplace_back([&, pid]() {
@@ -171,15 +199,21 @@ int main(int argc, char** argv) {
         });
     }
 
+    // ==========================================================
     // Processors
+    // ==========================================================
     std::vector<std::thread> processors;
     for (int proc_id = 0; proc_id < cfg.processor_count; ++proc_id) {
         processors.emplace_back([&, proc_id]() {
             Message msg;
             while (!stop_flag.load(std::memory_order_relaxed)) {
                 if (stage1_queues[proc_id]->pop(msg)) {
+                    uint64_t t_now = now_ns();
+                    double stage1_us = (t_now - msg.timestamp_ns) / 1000.0;
                     msg.processor_id = proc_id;
-                    msg.processed_ns = now_ns();
+                    msg.processed_ns = t_now;
+                    double processing_us = 0.0; // negligible in this simple demo
+
                     int strat_id = cfg.stage2_routing[msg.msg_type];
                     while (!stage2_queues[strat_id]->push(msg)) {
                         if (stop_flag.load()) return;
@@ -193,13 +227,22 @@ int main(int argc, char** argv) {
         });
     }
 
+    // ==========================================================
     // Strategies
+    // ==========================================================
     std::vector<std::thread> strategies;
     for (int sid = 0; sid < cfg.strategy_count; ++sid) {
         strategies.emplace_back([&, sid]() {
             Message msg;
             while (!stop_flag.load(std::memory_order_relaxed)) {
                 if (stage2_queues[sid]->pop(msg)) {
+                    uint64_t t_end = now_ns();
+                    double stage2_us = (t_end - msg.processed_ns) / 1000.0;
+                    double stage1_us = (msg.processed_ns - msg.timestamp_ns) / 1000.0;
+                    double processing_us = stage2_us; // simple proxy
+                    double total_us = (t_end - msg.timestamp_ns) / 1000.0;
+
+                    latencies.add(stage1_us, processing_us, stage2_us, total_us);
                     delivered++;
                 } else {
                     std::this_thread::yield();
@@ -208,7 +251,9 @@ int main(int argc, char** argv) {
         });
     }
 
+    // ==========================================================
     // Monitoring loop
+    // ==========================================================
     auto start = std::chrono::steady_clock::now();
     uint64_t prev_prod = 0, prev_proc = 0, prev_del = 0;
 
@@ -223,18 +268,11 @@ int main(int argc, char** argv) {
         uint64_t lost_now = (p - d) - (prev_prod - prev_del);
         double lost_m = lost_now / 1e6;
 
-
         prev_prod = p;
         prev_proc = r;
         prev_del = d;
 
-        // Fake latency metrics
-        double lat_stage1 = 0.3 + (rand() % 20) / 100.0;
-        double lat_proc = 0.15 + (rand() % 10) / 100.0;
-        double lat_stage2 = 0.4 + (rand() % 20) / 100.0;
-        double lat_total = lat_stage1 + lat_proc + lat_stage2;
-
-        // Collect queue sizes
+        // Queue sizes
         std::ostringstream s1, s2;
         s1 << "[";
         for (size_t i = 0; i < stage1_queues.size(); ++i) {
@@ -249,7 +287,6 @@ int main(int argc, char** argv) {
         }
         s2 << "]";
 
-
         std::ostringstream line;
         line << "[" << std::fixed << std::setprecision(2) << (double)sec
              << "s] Produced: " << produced_m << "M | "
@@ -257,11 +294,7 @@ int main(int argc, char** argv) {
              << "Delivered: " << delivered_m << "M | "
              << "Lost: " << lost_m << "M | "
              << "Stage1 Queues: " << s1.str()
-             << " | Stage2 Queues: " << s2.str() << ""
-             << " | Latencies(μs) - Stage1: " << lat_stage1
-             << " | Processing: " << lat_proc
-             << " | Stage2: " << lat_stage2
-             << " | Total: " << lat_total;
+             << " | Stage2 Queues: " << s2.str();
 
         std::cout << line.str() << std::endl;
         log_file << line.str() << "\n";
@@ -273,12 +306,38 @@ int main(int argc, char** argv) {
     for (auto& t : processors) t.join();
     for (auto& t : strategies) t.join();
 
+    // ==========================================================
+    // Summary
+    // ==========================================================
     summary_file << "=== PERFORMANCE SUMMARY ===\n";
     summary_file << "Scenario: " << scenario << "\n";
     summary_file << "Duration: " << cfg.duration_secs << " seconds\n";
     summary_file << "Produced:  " << produced << "\n";
     summary_file << "Processed: " << processed << "\n";
     summary_file << "Delivered: " << delivered << "\n";
+
+    summary_file << "\nLatency Percentiles (μs):\n";
+    summary_file << "Stage      p50    p90    p99\n";
+
+    summary_file << "Stage1   "
+                 << LatencyStats::percentile(latencies.stage1_us, 0.50) << "  "
+                 << LatencyStats::percentile(latencies.stage1_us, 0.90) << "  "
+                 << LatencyStats::percentile(latencies.stage1_us, 0.99) << "\n";
+
+    summary_file << "Process  "
+                 << LatencyStats::percentile(latencies.processing_us, 0.50) << "  "
+                 << LatencyStats::percentile(latencies.processing_us, 0.90) << "  "
+                 << LatencyStats::percentile(latencies.processing_us, 0.99) << "\n";
+
+    summary_file << "Stage2   "
+                 << LatencyStats::percentile(latencies.stage2_us, 0.50) << "  "
+                 << LatencyStats::percentile(latencies.stage2_us, 0.90) << "  "
+                 << LatencyStats::percentile(latencies.stage2_us, 0.99) << "\n";
+
+    summary_file << "Total    "
+                 << LatencyStats::percentile(latencies.total_us, 0.50) << "  "
+                 << LatencyStats::percentile(latencies.total_us, 0.90) << "  "
+                 << LatencyStats::percentile(latencies.total_us, 0.99) << "\n";
 
     std::cout << "Scenario " << scenario << " complete. Results written to "
               << summary_path << std::endl;
