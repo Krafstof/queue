@@ -1,0 +1,43 @@
+{
+  "scenario": "hot_type",
+  "duration_secs": 15,
+  "producers": {
+    "count": 4,
+    "messages_per_sec": 1000000,
+    "distribution": {
+      "msg_type_0": 0.7,
+      "msg_type_1": 0.1,
+      "msg_type_2": 0.1,
+      "msg_type_3": 0.1
+    }
+  },
+  "processors": {
+    "count": 4,
+    "processing_times_ns": {
+      "msg_type_0": 100,
+      "msg_type_1": 100,
+      "msg_type_2": 100,
+      "msg_type_3": 100
+    }
+  },
+  "strategies": {
+    "count": 3,
+    "processing_times_ns": {
+      "strategy_0": 100,
+      "strategy_1": 100,
+      "strategy_2": 100
+    }
+  },
+  "stage1_rules": [
+    {"msg_type": 0, "processors": [0]},
+    {"msg_type": 1, "processors": [1]},
+    {"msg_type": 2, "processors": [2]},
+    {"msg_type": 3, "processors": [3]}
+  ],
+  "stage2_rules": [
+    {"msg_type": 0, "strategy": 0, "ordering_required": true},
+    {"msg_type": 1, "strategy": 1, "ordering_required": true},
+    {"msg_type": 2, "strategy": 2, "ordering_required": true},
+    {"msg_type": 3, "strategy": 0, "ordering_required": true}
+  ]
+}
